@@ -1,0 +1,78 @@
+#!/usr/bin/env ruby
+
+require 'optparse'
+require 'redlock'
+
+def close_std!
+  STDIN.reopen '/dev/null'
+  STDOUT.reopen '/dev/null'
+  STDERR.reopen '/dev/null'
+end
+
+redis_opts = { host: 'localhost', port: 6379, db: 0 }
+redis_key = nil
+
+opts = OptionParser.new do |opts|
+  opts.banner = "USAGE: #$0 [--host REDISHOST] [--port REDISPORT] [--db REDISDB] --key REDISKEY"
+
+  opts.on('--host REDISHOST', 'Redis Host, default: localhost') do |host|
+    redis_opts[:host] = host
+  end
+
+  opts.on('--port REDISPORT', Integer, 'Redis Port, default: 6379') do |port|
+    redis_opts[:port] = port
+  end
+
+  opts.on('--db REDISDB', Integer, 'Redis DB, default: 0') do |db|
+    redis_opts[:db] = db
+  end
+
+  opts.on('--key REDISKEY', 'Redis Key to Lock') do |key|
+    redis_key = key
+  end
+
+  opts.on_tail('--help', 'Show this message') do
+    puts opts
+    exit
+  end
+end
+opts.parse!
+
+if redis_key.nil? || redis_key.size.zero?
+  puts opts
+  exit!
+end
+
+pidr, pidw = IO.pipe
+
+child = fork do
+          pidr.close
+          fork do
+            fail 'Failed to detach from controlling terminal' unless Process.setsid
+            trap 'SIGHUP', 'IGNORE'
+            Dir.chdir '/'
+
+            close_std!
+            lock_manager = Redlock::Client.new(["redis://#{redis_opts[:host]}:#{redis_opts[:port]}/#{redis_opts[:db]}"],
+                                               retry_delay: 1_000, retry_count: 3_600)
+            lockinfo = nil
+            until lockinfo
+              lockinfo = lock_manager.lock(redis_key, 3_600_000)
+            end
+            pidw.puts Process.pid
+            pidw.close
+
+            sigr, sigw = IO.pipe
+            Signal.trap('TERM') { sigw.puts }
+
+            IO.select([sigr])
+            lock_manager.unlock lockinfo
+          end
+          pidw.close
+          close_std!
+        end
+
+Process.detach(child)
+grandchild = pidr.readline.to_i
+puts grandchild
+close_std!
